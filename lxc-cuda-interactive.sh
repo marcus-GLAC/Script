@@ -257,10 +257,13 @@ fi
 start
 build_container
 
-# Get the CTID of the newly created container
-CTID=$(cat /tmp/ctid 2>/dev/null || echo "")
+# CTID is set by build.func; ensure it is valid and try a fallback if needed
+if [[ -z "${CTID:-}" ]]; then
+    # Fallback: lấy CTID lớn nhất (mới tạo gần nhất) từ danh sách LXC
+    CTID=$(pct list 2>/dev/null | awk 'NR>1 {last=$1} END{print last}')
+fi
 
-if [[ -n "$CTID" ]] && [[ "$CTID" =~ ^[0-9]+$ ]]; then
+if [[ -n "${CTID:-}" ]] && [[ "$CTID" =~ ^[0-9]+$ ]]; then
     
     # Configure GPU passthrough
     if [[ "$GPU_PASSTHROUGH" == "yes" ]]; then
@@ -301,6 +304,7 @@ if [[ -n "$CTID" ]] && [[ "$CTID" =~ ^[0-9]+$ ]]; then
     fi
 fi
 
+# Gọi description của community-scripts để in thông tin LXC
 description
 
 msg_ok "Completed successfully!\n"
