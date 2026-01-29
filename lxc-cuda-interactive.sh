@@ -110,6 +110,14 @@ check_whiptail() {
     fi
 }
 
+check_container_storage() {
+    local storage=$(get_default_container_storage)
+    if [ -z "$storage" ]; then
+        msg_error "Không tìm thấy storage nào hỗ trợ container!\n\nVui lòng tạo storage với content 'rootdir' trước khi chạy script.\nVí dụ: LVM-Thin (local-lvm), ZFS Pool, hoặc Directory storage.\n\nChạy lệnh sau để xem danh sách storage:\n  pvesm status"
+    fi
+    msg_ok "Found container storage: $storage"
+}
+
 run_checks() {
     header_info
     msg_info "Running prerequisite checks..."
@@ -117,6 +125,7 @@ run_checks() {
     check_proxmox
     check_nvidia
     check_whiptail
+    check_container_storage
     msg_ok "All checks passed"
     sleep 2
 }
@@ -196,6 +205,59 @@ list_storages() {
     pvesm status 2>/dev/null | \
         awk 'NR>1 {print $1}' | \
         grep -v "^$"
+}
+
+# Kiểm tra storage có hỗ trợ container (rootdir) không
+storage_supports_containers() {
+    local storage=$1
+    local content=$(pvesm status 2>/dev/null | awk -v st="$storage" '$1==st {print $0}')
+    
+    # Kiểm tra type của storage
+    local storage_type=$(echo "$content" | awk '{print $2}')
+    
+    # Các loại storage hỗ trợ container rootdir
+    case "$storage_type" in
+        lvmthin|lvm|zfspool|btrfs|dir|nfs|cifs|glusterfs|cephfs)
+            # Kiểm tra thêm xem có content 'rootdir' không
+            local storage_content=$(pvesm status --content rootdir 2>/dev/null | awk -v st="$storage" '$1==st {print $1}')
+            if [ -n "$storage_content" ]; then
+                return 0
+            fi
+            ;;
+    esac
+    return 1
+}
+
+# Lấy danh sách storage hỗ trợ container
+list_container_storages() {
+    while IFS= read -r storage; do
+        if storage_supports_containers "$storage"; then
+            echo "$storage"
+        fi
+    done < <(list_storages)
+}
+
+# Tìm storage mặc định phù hợp cho container
+get_default_container_storage() {
+    local preferred_storages=("local-lvm" "local-zfs" "local-btrfs")
+    
+    # Thử các storage ưu tiên trước
+    for storage in "${preferred_storages[@]}"; do
+        if storage_supports_containers "$storage"; then
+            echo "$storage"
+            return 0
+        fi
+    done
+    
+    # Nếu không có, lấy storage đầu tiên hỗ trợ container
+    local first_storage=$(list_container_storages | head -1)
+    if [ -n "$first_storage" ]; then
+        echo "$first_storage"
+        return 0
+    fi
+    
+    # Không tìm thấy storage phù hợp
+    return 1
 }
 
 list_bridges() {
@@ -452,22 +514,25 @@ select_storage() {
     local storages=()
     local counter=1
     
+    # Chỉ hiển thị storage hỗ trợ container
     while IFS= read -r storage; do
         # Get storage info
         local storage_info=$(pvesm status | awk -v st="$storage" '$1==st {print $2, $3, $4}')
         storages+=("$counter" "$storage ($storage_info)")
         ((counter++))
-    done < <(list_storages)
+    done < <(list_container_storages)
     
     if [ ${#storages[@]} -eq 0 ]; then
-        echo "$DEFAULT_STORAGE"
-        return 1
+        msg_error "Không tìm thấy storage nào hỗ trợ container!\nVui lòng tạo storage loại LVM-Thin, ZFS, hoặc Directory với content 'rootdir'."
     fi
+    
+    # Lấy default storage phù hợp
+    local default_storage=$(get_default_container_storage)
     
     local choice
     choice=$(whiptail --title "Select Storage" \
         --backtitle "$BACKTITLE" \
-        --menu "Choose storage pool for container:" \
+        --menu "Choose storage pool for container:\n(Only showing storages that support containers)" \
         20 $WIDTH 10 "${storages[@]}" 3>&1 1>&2 2>&3)
     
     if [ $? -eq 0 ] && [ -n "$choice" ]; then
@@ -476,7 +541,7 @@ select_storage() {
         echo "$storage_name" | awk '{print $1}'
         return 0
     else
-        echo "$DEFAULT_STORAGE"
+        echo "$default_storage"
         return 1
     fi
 }
@@ -986,9 +1051,11 @@ quick_install() {
     SWAP=$((MEMORY / 2))
     DISK=$(get_disk) || DISK=$DEFAULT_DISK
     
+    # Tự động tìm storage phù hợp (đã kiểm tra trong run_checks)
+    STORAGE=$(get_default_container_storage)
+    
     # Use defaults for other settings
     TEMPLATE="local:vztmpl/debian-12-standard_12.2-1_amd64.tar.zst"
-    STORAGE=$DEFAULT_STORAGE
     BRIDGE=$DEFAULT_BRIDGE
     IP="dhcp"
     CUDA_VERSION=$DEFAULT_CUDA
