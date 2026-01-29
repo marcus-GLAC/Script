@@ -251,9 +251,6 @@ function update_script() {
 # Check for NVIDIA on host before proceeding
 if [[ "$GPU_PASSTHROUGH" == "yes" ]]; then
     check_nvidia_host
-    msg_info "Detected GPUs:"
-    get_gpu_list
-    echo ""
 fi
 
 # Build container using community-scripts framework
