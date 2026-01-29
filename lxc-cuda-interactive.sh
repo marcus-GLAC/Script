@@ -118,6 +118,15 @@ check_container_storage() {
     msg_ok "Found container storage: $storage"
 }
 
+update_template_list() {
+    msg_info "Updating template list from repository..."
+    if pveam update &>/dev/null; then
+        msg_ok "Template list updated"
+    else
+        msg_warn "Could not update template list, using cached list"
+    fi
+}
+
 run_checks() {
     header_info
     msg_info "Running prerequisite checks..."
@@ -126,6 +135,7 @@ run_checks() {
     check_nvidia
     check_whiptail
     check_container_storage
+    update_template_list
     msg_ok "All checks passed"
     sleep 2
 }
@@ -199,6 +209,57 @@ list_templates() {
         grep -E "debian-12|ubuntu-24|ubuntu-22" | \
         awk '{print $2}' | \
         head -20
+}
+
+# Lấy template Debian 12 mới nhất từ repository
+get_latest_debian12_template() {
+    # Cập nhật danh sách template
+    pveam update &>/dev/null || true
+    
+    # Tìm template Debian 12 mới nhất
+    local template=$(pveam available --section system 2>/dev/null | \
+        grep -E "debian-12-standard" | \
+        awk '{print $2}' | \
+        sort -V | \
+        tail -1)
+    
+    if [ -n "$template" ]; then
+        echo "$template"
+        return 0
+    fi
+    
+    # Fallback: thử tìm bất kỳ Debian 12 nào
+    template=$(pveam available --section system 2>/dev/null | \
+        grep -E "debian-12" | \
+        awk '{print $2}' | \
+        head -1)
+    
+    if [ -n "$template" ]; then
+        echo "$template"
+        return 0
+    fi
+    
+    return 1
+}
+
+# Download template nếu chưa có
+download_template() {
+    local template_name=$1
+    local template_storage=${2:-local}
+    
+    # Kiểm tra xem template đã tồn tại chưa
+    if pveam list "$template_storage" 2>/dev/null | grep -q "$template_name"; then
+        msg_ok "Template $template_name đã có sẵn"
+        return 0
+    fi
+    
+    msg_info "Downloading template $template_name..."
+    if pveam download "$template_storage" "$template_name"; then
+        msg_ok "Template downloaded successfully"
+        return 0
+    else
+        return 1
+    fi
 }
 
 list_storages() {
@@ -489,23 +550,34 @@ select_template() {
         ((counter++))
     done < <(list_templates)
     
-    # If no templates found, use default
+    # If no templates found, try to get latest Debian 12
     if [ ${#templates[@]} -eq 0 ]; then
-        echo "local:vztmpl/debian-12-standard_12.2-1_amd64.tar.zst"
-        return 1
+        local default_template=$(get_latest_debian12_template)
+        if [ -n "$default_template" ]; then
+            echo "$default_template"
+            return 0
+        fi
+        msg_error "Không tìm thấy template nào! Vui lòng chạy: pveam update"
     fi
     
     local choice
     choice=$(whiptail --title "Select OS Template" \
         --backtitle "$BACKTITLE" \
-        --menu "Choose an OS template for your container:" \
+        --menu "Choose an OS template for your container:\n(Templates will be downloaded automatically if needed)" \
         22 $WIDTH 12 "${templates[@]}" 3>&1 1>&2 2>&3)
     
     if [ $? -eq 0 ] && [ -n "$choice" ]; then
+        # Trả về tên template (sẽ được xử lý trong create_container)
         echo "${templates[$((choice*2-1))]}"
         return 0
     else
-        echo "local:vztmpl/debian-12-standard_12.2-1_amd64.tar.zst"
+        # Sử dụng template mới nhất nếu user cancel
+        local default_template=$(get_latest_debian12_template)
+        if [ -n "$default_template" ]; then
+            echo "$default_template"
+            return 0
+        fi
+        echo "${templates[1]}"
         return 1
     fi
 }
@@ -712,17 +784,29 @@ create_container() {
         features="$features,nesting=1"
     fi
     
-    # Download template if needed
-    if [[ "$template" == local:* ]]; then
-        local template_name=$(basename "$template")
-        if [ ! -f "/var/lib/vz/template/cache/$template_name" ]; then
-            msg_info "Downloading template $template_name..."
-            pveam download local "$template_name" || msg_error "Failed to download template"
-        fi
+    # Xử lý template
+    local template_storage="local"
+    local template_name=""
+    local template_path=""
+    
+    if [[ "$template" == *:* ]]; then
+        # Format: storage:vztmpl/name hoặc storage:name
+        template_storage=$(echo "$template" | cut -d':' -f1)
+        template_name=$(basename "$template")
+        template_path="$template"
+    else
+        # Chỉ có tên template
+        template_name="$template"
+        template_path="${template_storage}:vztmpl/${template_name}"
+    fi
+    
+    # Download template nếu chưa có
+    if ! download_template "$template_name" "$template_storage"; then
+        msg_error "Failed to download template $template_name"
     fi
     
     # Create container
-    pct create "$ctid" "$template" \
+    pct create "$ctid" "$template_path" \
         --hostname "$hostname" \
         --cores "$cores" \
         --memory "$memory" \
@@ -1054,8 +1138,16 @@ quick_install() {
     # Tự động tìm storage phù hợp (đã kiểm tra trong run_checks)
     STORAGE=$(get_default_container_storage)
     
+    # Tự động tìm template Debian 12 mới nhất
+    msg_info "Đang tìm template Debian 12 mới nhất..."
+    TEMPLATE_NAME=$(get_latest_debian12_template)
+    if [ -z "$TEMPLATE_NAME" ]; then
+        msg_error "Không tìm thấy template Debian 12 trong repository!\nVui lòng chạy: pveam update"
+    fi
+    TEMPLATE="local:vztmpl/${TEMPLATE_NAME}"
+    msg_ok "Tìm thấy template: $TEMPLATE_NAME"
+    
     # Use defaults for other settings
-    TEMPLATE="local:vztmpl/debian-12-standard_12.2-1_amd64.tar.zst"
     BRIDGE=$DEFAULT_BRIDGE
     IP="dhcp"
     CUDA_VERSION=$DEFAULT_CUDA
@@ -1083,7 +1175,7 @@ Resources:
   Disk:     $DISK GB
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 Storage:    $STORAGE
-Template:   Debian 12 (Latest)
+Template:   $TEMPLATE_NAME
 Network:    $BRIDGE (DHCP)
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 GPU:        $gpu_info
@@ -1137,7 +1229,8 @@ advanced_install() {
     DISK=$(get_disk) || DISK=$DEFAULT_DISK
     
     # Template and storage
-    TEMPLATE=$(select_template)
+    TEMPLATE_NAME=$(select_template)
+    TEMPLATE="local:vztmpl/${TEMPLATE_NAME}"
     STORAGE=$(select_storage)
     
     # Network
@@ -1183,7 +1276,7 @@ Resources:
   Disk:     $DISK GB
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 Storage:    $STORAGE
-Template:   $(basename "$TEMPLATE")
+Template:   $TEMPLATE_NAME
 Network:    $BRIDGE ($IP)
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 GPU:        $gpu_info
