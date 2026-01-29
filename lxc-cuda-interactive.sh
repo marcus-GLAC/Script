@@ -1,8 +1,9 @@
 #!/bin/bash
 #===============================================================================
 # LXC CUDA Container Setup Script for Proxmox VE
-# Interactive Menu-Driven Installation
-# Version: 2.0
+# Interactive Menu-Driven Installation with GPU Selection
+# Version: 2.1
+# Repository: https://github.com/marcus-GLAC/Script
 #===============================================================================
 
 set -euo pipefail
@@ -31,11 +32,11 @@ DEFAULT_CUDA="12.8"
 
 # Script title for whiptail
 TITLE="LXC CUDA Container Setup"
-BACKTITLE="Proxmox VE Helper Scripts - LXC with NVIDIA GPU Support"
+BACKTITLE="Proxmox VE Helper Scripts - LXC with NVIDIA GPU Support v2.1"
 
 # Terminal size
 HEIGHT=20
-WIDTH=70
+WIDTH=78
 
 #===============================================================================
 # UTILITY FUNCTIONS
@@ -69,6 +70,7 @@ header_info() {
 \______/|_|\_\____/   \_____|_|  |_|_____/|_| |_|
                                                    
    Proxmox LXC Container with NVIDIA CUDA Support
+           https://github.com/marcus-GLAC/Script
 EOF
     echo ""
 }
@@ -117,6 +119,66 @@ run_checks() {
     check_whiptail
     msg_ok "All checks passed"
     sleep 2
+}
+
+#===============================================================================
+# GPU DETECTION AND SELECTION
+#===============================================================================
+
+get_gpu_count() {
+    nvidia-smi --query-gpu=count --format=csv,noheader | head -1
+}
+
+get_gpu_list() {
+    nvidia-smi --query-gpu=index,name,memory.total,driver_version --format=csv,noheader 2>/dev/null
+}
+
+get_gpu_info_by_index() {
+    local idx=$1
+    nvidia-smi -i "$idx" --query-gpu=name,memory.total,driver_version,pci.bus_id --format=csv,noheader 2>/dev/null
+}
+
+select_gpu() {
+    local gpu_count=$(get_gpu_count)
+    
+    if [ "$gpu_count" -eq 0 ]; then
+        msg_error "No NVIDIA GPUs detected"
+    elif [ "$gpu_count" -eq 1 ]; then
+        # Only one GPU, use it automatically
+        echo "0"
+        return 0
+    fi
+    
+    # Multiple GPUs, let user choose
+    local gpu_list=()
+    local counter=0
+    
+    while IFS= read -r gpu_info; do
+        local index=$(echo "$gpu_info" | cut -d',' -f1)
+        local name=$(echo "$gpu_info" | cut -d',' -f2 | xargs)
+        local memory=$(echo "$gpu_info" | cut -d',' -f3 | xargs)
+        local driver=$(echo "$gpu_info" | cut -d',' -f4 | xargs)
+        
+        gpu_list+=("$index" "GPU $index: $name | $memory | Driver: $driver")
+        ((counter++))
+    done < <(get_gpu_list)
+    
+    # Add option for all GPUs
+    gpu_list+=("all" "All GPUs (Passthrough all $gpu_count GPUs)")
+    
+    local choice
+    choice=$(whiptail --title "Select GPU" \
+        --backtitle "$BACKTITLE" \
+        --menu "Multiple GPUs detected. Choose which GPU to passthrough:" \
+        20 $WIDTH 10 "${gpu_list[@]}" 3>&1 1>&2 2>&3)
+    
+    if [ $? -eq 0 ] && [ -n "$choice" ]; then
+        echo "$choice"
+        return 0
+    else
+        echo "0"
+        return 1
+    fi
 }
 
 #===============================================================================
@@ -173,24 +235,30 @@ validate_ctid() {
 #===============================================================================
 
 show_welcome() {
+    local gpu_count=$(get_gpu_count)
+    local gpu_info=$(get_gpu_list | head -3)
+    
     whiptail --title "$TITLE" \
         --msgbox "Welcome to LXC CUDA Container Setup!\n\n\
 This wizard will guide you through creating a new LXC container with:\n\n\
   ✓ NVIDIA GPU passthrough\n\
   ✓ CUDA Toolkit installation\n\
   ✓ Development tools\n\n\
-Detected GPU:\n$(get_nvidia_info)\n\n\
+Detected GPUs: $gpu_count\n\
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\
+$gpu_info\n\
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n\
 Press OK to continue..." \
-        18 $WIDTH
+        22 $WIDTH
 }
 
 main_menu() {
     local choice
     choice=$(whiptail --title "$TITLE" \
         --backtitle "$BACKTITLE" \
-        --menu "Choose installation mode:" 15 $WIDTH 5 \
-        "1" "Quick Install (Default Settings)" \
-        "2" "Advanced Install (Custom Settings)" \
+        --menu "Choose installation mode:" 16 $WIDTH 5 \
+        "1" "Quick Install (Recommended for single GPU)" \
+        "2" "Advanced Install (Custom configuration)" \
         "3" "View GPU Information" \
         "4" "Exit" \
         3>&1 1>&2 2>&3)
@@ -246,25 +314,107 @@ Only alphanumeric characters and hyphens allowed." \
     fi
 }
 
-get_resources() {
-    local form_data
+get_cpu_cores() {
+    local cores
     
-    form_data=$(whiptail --title "Resource Allocation" \
+    # Get total CPU cores on host
+    local total_cores=$(nproc)
+    local suggested_cores=$((total_cores / 2))
+    [ $suggested_cores -lt 2 ] && suggested_cores=2
+    [ $suggested_cores -gt 16 ] && suggested_cores=16
+    
+    cores=$(whiptail --title "CPU Cores" \
         --backtitle "$BACKTITLE" \
-        --form "Configure container resources:" 16 $WIDTH 4 \
-        "CPU Cores:" 1 1 "$DEFAULT_CORES" 1 20 10 0 \
-        "Memory (MB):" 2 1 "$DEFAULT_MEMORY" 2 20 10 0 \
-        "Swap (MB):" 3 1 "$DEFAULT_SWAP" 3 20 10 0 \
-        "Disk (GB):" 4 1 "$DEFAULT_DISK" 4 20 10 0 \
-        3>&1 1>&2 2>&3)
+        --inputbox "Enter number of CPU cores for the container:\n\n\
+Host has: $total_cores cores\n\
+Suggested: $suggested_cores cores\n\
+Range: 1-$total_cores" \
+        14 $WIDTH "$suggested_cores" 3>&1 1>&2 2>&3)
     
-    if [ $? -eq 0 ]; then
-        echo "$form_data"
-        return 0
-    else
-        echo -e "$DEFAULT_CORES\n$DEFAULT_MEMORY\n$DEFAULT_SWAP\n$DEFAULT_DISK"
-        return 1
+    if [ $? -eq 0 ] && [ -n "$cores" ]; then
+        # Validate range
+        if [ "$cores" -ge 1 ] && [ "$cores" -le "$total_cores" ]; then
+            echo "$cores"
+            return 0
+        fi
     fi
+    
+    echo "$DEFAULT_CORES"
+    return 1
+}
+
+get_memory() {
+    local memory
+    
+    # Get total memory on host (in MB)
+    local total_mem=$(free -m | awk '/^Mem:/{print $2}')
+    local suggested_mem=$((total_mem / 2))
+    [ $suggested_mem -lt 4096 ] && suggested_mem=4096
+    [ $suggested_mem -gt 65536 ] && suggested_mem=65536
+    
+    memory=$(whiptail --title "Memory (RAM)" \
+        --backtitle "$BACKTITLE" \
+        --inputbox "Enter memory size in MB:\n\n\
+Host has: $total_mem MB\n\
+Suggested: $suggested_mem MB\n\
+Minimum: 2048 MB\n\
+Range: 2048-$total_mem" \
+        15 $WIDTH "$suggested_mem" 3>&1 1>&2 2>&3)
+    
+    if [ $? -eq 0 ] && [ -n "$memory" ]; then
+        # Validate range
+        if [ "$memory" -ge 2048 ] && [ "$memory" -le "$total_mem" ]; then
+            echo "$memory"
+            return 0
+        fi
+    fi
+    
+    echo "$DEFAULT_MEMORY"
+    return 1
+}
+
+get_swap() {
+    local swap
+    local default_swap=$(($(get_memory 2>/dev/null || echo $DEFAULT_MEMORY) / 2))
+    
+    swap=$(whiptail --title "Swap Memory" \
+        --backtitle "$BACKTITLE" \
+        --inputbox "Enter swap size in MB:\n\n\
+Suggested: $default_swap MB (half of RAM)\n\
+Set to 0 to disable swap\n\
+Range: 0-65536" \
+        13 $WIDTH "$default_swap" 3>&1 1>&2 2>&3)
+    
+    if [ $? -eq 0 ] && [ -n "$swap" ]; then
+        echo "$swap"
+        return 0
+    fi
+    
+    echo "$DEFAULT_SWAP"
+    return 1
+}
+
+get_disk() {
+    local disk
+    
+    disk=$(whiptail --title "Disk Size" \
+        --backtitle "$BACKTITLE" \
+        --inputbox "Enter disk size in GB:\n\n\
+Minimum: 20 GB (for OS + CUDA)\n\
+Recommended: 50+ GB\n\
+Range: 20-1000" \
+        13 $WIDTH "$DEFAULT_DISK" 3>&1 1>&2 2>&3)
+    
+    if [ $? -eq 0 ] && [ -n "$disk" ]; then
+        # Validate range
+        if [ "$disk" -ge 20 ] && [ "$disk" -le 1000 ]; then
+            echo "$disk"
+            return 0
+        fi
+    fi
+    
+    echo "$DEFAULT_DISK"
+    return 1
 }
 
 select_template() {
@@ -287,7 +437,7 @@ select_template() {
     choice=$(whiptail --title "Select OS Template" \
         --backtitle "$BACKTITLE" \
         --menu "Choose an OS template for your container:" \
-        20 $WIDTH 10 "${templates[@]}" 3>&1 1>&2 2>&3)
+        22 $WIDTH 12 "${templates[@]}" 3>&1 1>&2 2>&3)
     
     if [ $? -eq 0 ] && [ -n "$choice" ]; then
         echo "${templates[$((choice*2-1))]}"
@@ -303,7 +453,9 @@ select_storage() {
     local counter=1
     
     while IFS= read -r storage; do
-        storages+=("$counter" "$storage")
+        # Get storage info
+        local storage_info=$(pvesm status | awk -v st="$storage" '$1==st {print $2, $3, $4}')
+        storages+=("$counter" "$storage ($storage_info)")
         ((counter++))
     done < <(list_storages)
     
@@ -315,11 +467,13 @@ select_storage() {
     local choice
     choice=$(whiptail --title "Select Storage" \
         --backtitle "$BACKTITLE" \
-        --menu "Choose storage for container:" \
-        18 $WIDTH 8 "${storages[@]}" 3>&1 1>&2 2>&3)
+        --menu "Choose storage pool for container:" \
+        20 $WIDTH 10 "${storages[@]}" 3>&1 1>&2 2>&3)
     
     if [ $? -eq 0 ] && [ -n "$choice" ]; then
-        echo "${storages[$((choice*2-1))]}"
+        # Extract just the storage name (before the space)
+        local storage_name="${storages[$((choice*2-1))]}"
+        echo "$storage_name" | awk '{print $1}'
         return 0
     else
         echo "$DEFAULT_STORAGE"
@@ -332,7 +486,13 @@ select_network_bridge() {
     local counter=1
     
     while IFS= read -r bridge; do
-        bridges+=("$counter" "$bridge")
+        # Get IP info for bridge
+        local ip_info=$(ip -4 addr show "$bridge" 2>/dev/null | grep -oP '(?<=inet\s)\d+(\.\d+){3}/\d+' | head -1)
+        if [ -n "$ip_info" ]; then
+            bridges+=("$counter" "$bridge ($ip_info)")
+        else
+            bridges+=("$counter" "$bridge")
+        fi
         ((counter++))
     done < <(list_bridges)
     
@@ -345,10 +505,12 @@ select_network_bridge() {
     choice=$(whiptail --title "Network Bridge" \
         --backtitle "$BACKTITLE" \
         --menu "Choose network bridge:" \
-        16 $WIDTH 6 "${bridges[@]}" 3>&1 1>&2 2>&3)
+        18 $WIDTH 8 "${bridges[@]}" 3>&1 1>&2 2>&3)
     
     if [ $? -eq 0 ] && [ -n "$choice" ]; then
-        echo "${bridges[$((choice*2-1))]}"
+        # Extract just the bridge name
+        local bridge_name="${bridges[$((choice*2-1))]}"
+        echo "$bridge_name" | awk '{print $1}'
         return 0
     else
         echo "$DEFAULT_BRIDGE"
@@ -362,9 +524,9 @@ select_network_mode() {
         --backtitle "$BACKTITLE" \
         --menu "Select IP configuration mode:" \
         14 $WIDTH 3 \
-        "1" "DHCP (Automatic IP)" \
-        "2" "Static IP (Manual)" \
-        "3" "Manual (Configure later)" \
+        "1" "DHCP (Automatic IP assignment)" \
+        "2" "Static IP (Manual configuration)" \
+        "3" "Manual (Configure after creation)" \
         3>&1 1>&2 2>&3)
     
     case $choice in
@@ -373,14 +535,14 @@ select_network_mode() {
             local ip
             ip=$(whiptail --title "Static IP Configuration" \
                 --backtitle "$BACKTITLE" \
-                --inputbox "Enter IP address with CIDR:\n\nExample: 192.168.1.100/24" \
+                --inputbox "Enter IP address with CIDR notation:\n\nExample: 192.168.1.100/24" \
                 10 $WIDTH "192.168.1.100/24" 3>&1 1>&2 2>&3)
             
             if [ $? -eq 0 ] && [ -n "$ip" ]; then
                 local gw
                 gw=$(whiptail --title "Gateway" \
                     --backtitle "$BACKTITLE" \
-                    --inputbox "Enter gateway IP:\n\nExample: 192.168.1.1" \
+                    --inputbox "Enter gateway IP address:\n\nExample: 192.168.1.1" \
                     10 $WIDTH "192.168.1.1" 3>&1 1>&2 2>&3)
                 
                 if [ $? -eq 0 ] && [ -n "$gw" ]; then
@@ -402,13 +564,13 @@ select_cuda_version() {
     choice=$(whiptail --title "CUDA Toolkit Version" \
         --backtitle "$BACKTITLE" \
         --menu "Select CUDA Toolkit version to install:" \
-        16 $WIDTH 6 \
+        18 $WIDTH 7 \
         "1" "CUDA 12.8 (Latest - Recommended)" \
         "2" "CUDA 12.6" \
         "3" "CUDA 12.4" \
         "4" "CUDA 12.2" \
-        "5" "CUDA 11.8 (Legacy)" \
-        "6" "Skip CUDA installation" \
+        "5" "CUDA 11.8 (Legacy support)" \
+        "6" "Skip CUDA installation (Install manually later)" \
         3>&1 1>&2 2>&3)
     
     case $choice in
@@ -426,14 +588,15 @@ select_additional_options() {
     local options
     options=$(whiptail --title "Additional Options" \
         --backtitle "$BACKTITLE" \
-        --checklist "Select additional features:" \
-        18 $WIDTH 8 \
-        "1" "Install development tools (git, cmake, gcc)" ON \
-        "2" "Install monitoring tools (htop, nvtop, btop)" ON \
-        "3" "Install Python3 and pip" ON \
-        "4" "Enable container nesting (for Docker)" ON \
-        "5" "Auto-start container on boot" ON \
-        "6" "Install text editors (vim, nano)" ON \
+        --checklist "Select additional features to install:" \
+        20 $WIDTH 8 \
+        "1" "Development tools (git, cmake, gcc, build-essential)" ON \
+        "2" "Monitoring tools (htop, nvtop, btop, glances)" ON \
+        "3" "Python3 with pip and virtualenv" ON \
+        "4" "Enable container nesting (for Docker support)" ON \
+        "5" "Auto-start container on host boot" ON \
+        "6" "Text editors (vim, nano)" ON \
+        "7" "Network tools (curl, wget, net-tools)" ON \
         3>&1 1>&2 2>&3)
     
     echo "$options"
@@ -444,21 +607,19 @@ confirm_configuration() {
     
     whiptail --title "Confirm Configuration" \
         --backtitle "$BACKTITLE" \
-        --yesno "$config\n\nProceed with installation?" \
-        22 $WIDTH
+        --yesno "$config\n\nDo you want to proceed with the installation?" \
+        24 $WIDTH
 }
 
 show_gpu_info() {
     local gpu_info
-    gpu_info=$(nvidia-smi --query-gpu=index,name,driver_version,memory.total,memory.used,temperature.gpu,utilization.gpu \
-        --format=csv,noheader 2>/dev/null)
+    gpu_info=$(nvidia-smi --query-gpu=index,name,driver_version,memory.total,memory.used,temperature.gpu,utilization.gpu,power.draw \
+        --format=csv 2>/dev/null)
     
     whiptail --title "GPU Information" \
         --backtitle "$BACKTITLE" \
-        --msgbox "Detected NVIDIA GPU(s):\n\n$gpu_info\n\n\
-Driver Information:\n$(nvidia-smi --query-gpu=driver_version --format=csv,noheader | head -1)\n\n\
-Press OK to return to menu." \
-        20 $WIDTH
+        --msgbox "Detected NVIDIA GPU(s):\n\n$gpu_info\n\nPress OK to return to menu." \
+        22 $WIDTH
 }
 
 #===============================================================================
@@ -490,7 +651,7 @@ create_container() {
     if [[ "$template" == local:* ]]; then
         local template_name=$(basename "$template")
         if [ ! -f "/var/lib/vz/template/cache/$template_name" ]; then
-            msg_info "Downloading template..."
+            msg_info "Downloading template $template_name..."
             pveam download local "$template_name" || msg_error "Failed to download template"
         fi
     fi
@@ -508,49 +669,78 @@ create_container() {
         --onboot "$onboot" \
         --start 0 || msg_error "Failed to create container"
     
-    msg_ok "Container created successfully"
+    msg_ok "Container $ctid created successfully"
 }
 
 configure_gpu_passthrough() {
     local ctid=$1
+    local gpu_selection=$2
     
-    msg_info "Configuring GPU passthrough..."
+    msg_info "Configuring GPU passthrough for container $ctid..."
     
     local conf="/etc/pve/lxc/${ctid}.conf"
     
     # Backup
     cp "$conf" "${conf}.backup"
     
-    # Add GPU configuration
+    # Add base GPU configuration
     cat >> "$conf" << 'EOF'
 
 # NVIDIA GPU Passthrough Configuration
 lxc.cgroup2.devices.allow: c 195:* rwm
 lxc.cgroup2.devices.allow: c 509:* rwm
-lxc.mount.entry: /dev/nvidia0 dev/nvidia0 none bind,optional,create=file
-lxc.mount.entry: /dev/nvidiactl dev/nvidiactl none bind,optional,create=file
-lxc.mount.entry: /dev/nvidia-uvm dev/nvidia-uvm none bind,optional,create=file
-lxc.mount.entry: /dev/nvidia-uvm-tools dev/nvidia-uvm-tools none bind,optional,create=file
-lxc.mount.entry: /dev/nvidia-modeset dev/nvidia-modeset none bind,optional,create=file
 EOF
 
-    # Add all NVIDIA devices
-    for device in /dev/nvidia*; do
-        if [ -e "$device" ] && [[ ! "$device" =~ nvidia-caps ]]; then
-            local dev_name=$(basename "$device")
-            if ! grep -q "$dev_name" "$conf"; then
+    # Add devices based on GPU selection
+    if [ "$gpu_selection" = "all" ]; then
+        msg_info "Configuring passthrough for all GPUs..."
+        
+        # Add all GPU devices
+        local gpu_count=$(get_gpu_count)
+        for ((i=0; i<gpu_count; i++)); do
+            echo "lxc.mount.entry: /dev/nvidia${i} dev/nvidia${i} none bind,optional,create=file" >> "$conf"
+        done
+        
+        # Add common devices
+        for device in /dev/nvidiactl /dev/nvidia-uvm /dev/nvidia-uvm-tools /dev/nvidia-modeset; do
+            if [ -e "$device" ]; then
+                local dev_name=$(basename "$device")
                 echo "lxc.mount.entry: $device dev/$dev_name none bind,optional,create=file" >> "$conf"
             fi
-        fi
-    done
+        done
+        
+        msg_ok "All $gpu_count GPUs configured for passthrough"
+    else
+        msg_info "Configuring passthrough for GPU $gpu_selection..."
+        
+        # Add specific GPU device
+        echo "lxc.mount.entry: /dev/nvidia${gpu_selection} dev/nvidia${gpu_selection} none bind,optional,create=file" >> "$conf"
+        
+        # Add common devices
+        for device in /dev/nvidiactl /dev/nvidia-uvm /dev/nvidia-uvm-tools /dev/nvidia-modeset; do
+            if [ -e "$device" ]; then
+                local dev_name=$(basename "$device")
+                echo "lxc.mount.entry: $device dev/$dev_name none bind,optional,create=file" >> "$conf"
+            fi
+        done
+        
+        msg_ok "GPU $gpu_selection configured for passthrough"
+    fi
     
-    msg_ok "GPU passthrough configured"
+    # Set CUDA_VISIBLE_DEVICES if specific GPU selected
+    if [ "$gpu_selection" != "all" ]; then
+        cat >> "$conf" << EOF
+
+# Set CUDA_VISIBLE_DEVICES for GPU $gpu_selection
+lxc.environment: CUDA_VISIBLE_DEVICES=$gpu_selection
+EOF
+    fi
 }
 
 start_container() {
     local ctid=$1
     
-    msg_info "Starting container..."
+    msg_info "Starting container $ctid..."
     pct start "$ctid" || msg_error "Failed to start container"
     
     sleep 3
@@ -565,7 +755,11 @@ start_container() {
         ((retry++))
     done
     
-    msg_ok "Container started"
+    if [ $retry -ge 30 ]; then
+        msg_warn "Container may not be fully ready, continuing anyway..."
+    else
+        msg_ok "Container started and ready"
+    fi
 }
 
 install_cuda_toolkit() {
@@ -575,8 +769,9 @@ install_cuda_toolkit() {
     local install_monitor=$4
     local install_python=$5
     local install_editors=$6
+    local install_network=$7
     
-    msg_info "Installing CUDA Toolkit $cuda_version..."
+    msg_info "Installing packages in container $ctid..."
     
     # Update system
     msg_info "Updating system packages..."
@@ -594,7 +789,8 @@ install_cuda_toolkit() {
             wget curl gnupg2 \
             software-properties-common \
             ca-certificates \
-            apt-transport-https
+            apt-transport-https \
+            lsb-release
     " || msg_error "Failed to install base packages"
     
     # Install development tools
@@ -606,7 +802,8 @@ install_cuda_toolkit() {
                 build-essential \
                 g++ gcc make cmake \
                 pkg-config \
-                git
+                git \
+                autoconf automake libtool
         " || msg_warn "Some development tools failed to install"
     fi
     
@@ -619,26 +816,29 @@ install_cuda_toolkit() {
                 htop btop \
                 glances \
                 pciutils \
-                lshw
+                lshw \
+                sysstat
         " || msg_warn "Some monitoring tools failed to install"
         
-        # Try to install nvtop (may not be in repos)
+        # Try to install nvtop
         pct exec "$ctid" -- bash -c "
             export DEBIAN_FRONTEND=noninteractive
-            apt-get install -y nvtop 2>/dev/null || true
+            apt-get install -y nvtop 2>/dev/null || echo 'nvtop not available in repos, skipping...'
         "
     fi
     
     # Install Python
     if [ "$install_python" = "true" ]; then
-        msg_info "Installing Python3..."
+        msg_info "Installing Python3 and tools..."
         pct exec "$ctid" -- bash -c "
             export DEBIAN_FRONTEND=noninteractive
             apt-get install -y \
                 python3 \
                 python3-pip \
                 python3-dev \
-                python3-venv
+                python3-venv \
+                python3-setuptools \
+                python3-wheel
         " || msg_warn "Python installation had issues"
     fi
     
@@ -649,6 +849,21 @@ install_cuda_toolkit() {
             export DEBIAN_FRONTEND=noninteractive
             apt-get install -y vim nano
         " || msg_warn "Text editors installation had issues"
+    fi
+    
+    # Install network tools
+    if [ "$install_network" = "true" ]; then
+        msg_info "Installing network tools..."
+        pct exec "$ctid" -- bash -c "
+            export DEBIAN_FRONTEND=noninteractive
+            apt-get install -y \
+                curl wget \
+                net-tools \
+                iputils-ping \
+                dnsutils \
+                telnet \
+                netcat-openbsd
+        " || msg_warn "Network tools installation had issues"
     fi
     
     # Install CUDA
@@ -665,14 +880,14 @@ install_cuda_toolkit() {
         local cuda_minor=$(echo "$cuda_version" | cut -d. -f2)
         local cuda_pkg="cuda-toolkit-${cuda_major}-${cuda_minor}"
         
-        msg_info "Installing CUDA Toolkit $cuda_version (this may take a while)..."
+        msg_info "Installing CUDA Toolkit $cuda_version (this may take 5-10 minutes)..."
         pct exec "$ctid" -- bash -c "
             export DEBIAN_FRONTEND=noninteractive
             apt-get install -y $cuda_pkg
         " || msg_error "Failed to install CUDA Toolkit"
         
         # Configure CUDA environment
-        msg_info "Configuring CUDA environment..."
+        msg_info "Configuring CUDA environment variables..."
         pct exec "$ctid" -- bash -c "
             cat > /etc/profile.d/cuda.sh << 'CUDA_ENV'
 export PATH=/usr/local/cuda-${cuda_version}/bin\${PATH:+:\${PATH}}
@@ -680,6 +895,9 @@ export LD_LIBRARY_PATH=/usr/local/cuda-${cuda_version}/lib64\${LD_LIBRARY_PATH:+
 export CUDA_HOME=/usr/local/cuda-${cuda_version}
 CUDA_ENV
             chmod +x /etc/profile.d/cuda.sh
+            
+            # Also add to bashrc for convenience
+            echo 'source /etc/profile.d/cuda.sh' >> /root/.bashrc
         "
         
         msg_ok "CUDA Toolkit $cuda_version installed successfully"
@@ -693,45 +911,56 @@ CUDA_ENV
         rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
     " || true
     
-    msg_ok "Installation completed"
+    msg_ok "All packages installed successfully"
 }
 
 validate_installation() {
     local ctid=$1
     local cuda_version=$2
+    local gpu_selection=$3
     
     msg_info "Validating installation..."
     
     echo ""
-    echo "=========================================="
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
     echo "           Validation Results"
-    echo "=========================================="
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
     echo ""
     
     # Test nvidia-smi
     echo -e "${CYAN}Testing nvidia-smi...${NC}"
     if pct exec "$ctid" -- nvidia-smi &>/dev/null; then
-        msg_ok "nvidia-smi works"
-        pct exec "$ctid" -- nvidia-smi --query-gpu=name,driver_version --format=csv,noheader
+        msg_ok "nvidia-smi works correctly"
+        echo ""
+        pct exec "$ctid" -- nvidia-smi --query-gpu=index,name,driver_version,memory.total --format=table
+        echo ""
     else
-        msg_warn "nvidia-smi failed (may need container restart)"
+        msg_warn "nvidia-smi failed - GPU may not be accessible"
+        echo "Try restarting the container: pct restart $ctid"
     fi
-    
-    echo ""
     
     # Test nvcc if CUDA installed
     if [ "$cuda_version" != "skip" ]; then
-        echo -e "${CYAN}Testing CUDA compiler...${NC}"
+        echo ""
+        echo -e "${CYAN}Testing CUDA compiler (nvcc)...${NC}"
         if pct exec "$ctid" -- bash -c "source /etc/profile.d/cuda.sh && nvcc --version" &>/dev/null; then
-            msg_ok "CUDA compiler works"
+            msg_ok "CUDA compiler works correctly"
             pct exec "$ctid" -- bash -c "source /etc/profile.d/cuda.sh && nvcc --version" | grep "release"
         else
             msg_warn "CUDA compiler test failed"
         fi
     fi
     
+    # Show GPU assignment
     echo ""
-    echo "=========================================="
+    if [ "$gpu_selection" = "all" ]; then
+        echo -e "${GREEN}✓${NC} All GPUs are passed through to this container"
+    else
+        echo -e "${GREEN}✓${NC} GPU $gpu_selection is passed through to this container"
+    fi
+    
+    echo ""
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 }
 
 #===============================================================================
@@ -741,18 +970,23 @@ validate_installation() {
 quick_install() {
     header_info
     
-    msg_info "Starting Quick Install with default settings..."
+    msg_info "Starting Quick Install with recommended settings..."
     echo ""
     
     # Get required info
     CTID=$(get_container_id) || exit 0
     HOSTNAME=$(get_hostname) || HOSTNAME="lxc-cuda-$CTID"
     
-    # Use defaults
-    CORES=$DEFAULT_CORES
-    MEMORY=$DEFAULT_MEMORY
-    SWAP=$DEFAULT_SWAP
-    DISK=$DEFAULT_DISK
+    # Select GPU
+    GPU_SELECTION=$(select_gpu)
+    
+    # Get resources with smart defaults
+    CORES=$(get_cpu_cores) || CORES=$DEFAULT_CORES
+    MEMORY=$(get_memory) || MEMORY=$DEFAULT_MEMORY
+    SWAP=$((MEMORY / 2))
+    DISK=$(get_disk) || DISK=$DEFAULT_DISK
+    
+    # Use defaults for other settings
     TEMPLATE="local:vztmpl/debian-12-standard_12.2-1_amd64.tar.zst"
     STORAGE=$DEFAULT_STORAGE
     BRIDGE=$DEFAULT_BRIDGE
@@ -762,23 +996,41 @@ quick_install() {
     INSTALL_MONITOR="true"
     INSTALL_PYTHON="true"
     INSTALL_EDITORS="true"
+    INSTALL_NETWORK="true"
     ONBOOT="1"
     NESTING="true"
     
     # Show configuration
+    local gpu_info=$(get_gpu_info_by_index "$GPU_SELECTION")
+    [ "$GPU_SELECTION" = "all" ] && gpu_info="All GPUs ($(get_gpu_count) total)"
+    
     local config="Container Configuration:
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-CTID:      $CTID
-Hostname:  $HOSTNAME
-CPU:       $CORES cores
-Memory:    $MEMORY MB
-Swap:      $SWAP MB
-Disk:      $DISK GB
-Storage:   $STORAGE
-Template:  Debian 12
-Network:   $BRIDGE (DHCP)
-CUDA:      $CUDA_VERSION
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+CTID:       $CTID
+Hostname:   $HOSTNAME
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Resources:
+  CPU:      $CORES cores
+  Memory:   $MEMORY MB
+  Swap:     $SWAP MB
+  Disk:     $DISK GB
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Storage:    $STORAGE
+Template:   Debian 12 (Latest)
+Network:    $BRIDGE (DHCP)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+GPU:        $gpu_info
+CUDA:       $CUDA_VERSION (Latest)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Features:
+  • Development tools (git, cmake, gcc)
+  • Monitoring tools (htop, nvtop, btop)
+  • Python3 with pip
+  • Text editors (vim, nano)
+  • Network tools
+  • Container nesting enabled
+  • Auto-start on boot
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
     
     if ! confirm_configuration "$config"; then
         msg_warn "Installation cancelled"
@@ -789,32 +1041,33 @@ CUDA:      $CUDA_VERSION
     create_container "$CTID" "$HOSTNAME" "$CORES" "$MEMORY" "$SWAP" "$DISK" \
         "$TEMPLATE" "$STORAGE" "$BRIDGE" "$IP" "$ONBOOT" "$NESTING"
     
-    configure_gpu_passthrough "$CTID"
+    configure_gpu_passthrough "$CTID" "$GPU_SELECTION"
     start_container "$CTID"
     install_cuda_toolkit "$CTID" "$CUDA_VERSION" "$INSTALL_DEV" "$INSTALL_MONITOR" \
-        "$INSTALL_PYTHON" "$INSTALL_EDITORS"
-    validate_installation "$CTID" "$CUDA_VERSION"
+        "$INSTALL_PYTHON" "$INSTALL_EDITORS" "$INSTALL_NETWORK"
+    validate_installation "$CTID" "$CUDA_VERSION" "$GPU_SELECTION"
     
-    show_completion_summary "$CTID" "$HOSTNAME"
+    show_completion_summary "$CTID" "$HOSTNAME" "$GPU_SELECTION"
 }
 
 advanced_install() {
     header_info
     
-    msg_info "Starting Advanced Install..."
+    msg_info "Starting Advanced Install with custom configuration..."
     echo ""
     
     # Gather all configuration
     CTID=$(get_container_id) || exit 0
     HOSTNAME=$(get_hostname) || HOSTNAME="lxc-cuda-$CTID"
     
+    # Select GPU first
+    GPU_SELECTION=$(select_gpu)
+    
     # Resources
-    local resources
-    resources=$(get_resources)
-    CORES=$(echo "$resources" | sed -n '1p')
-    MEMORY=$(echo "$resources" | sed -n '2p')
-    SWAP=$(echo "$resources" | sed -n '3p')
-    DISK=$(echo "$resources" | sed -n '4p')
+    CORES=$(get_cpu_cores) || CORES=$DEFAULT_CORES
+    MEMORY=$(get_memory) || MEMORY=$DEFAULT_MEMORY
+    SWAP=$(get_swap) || SWAP=$DEFAULT_SWAP
+    DISK=$(get_disk) || DISK=$DEFAULT_DISK
     
     # Template and storage
     TEMPLATE=$(select_template)
@@ -837,6 +1090,7 @@ advanced_install() {
     NESTING="false"
     ONBOOT="0"
     INSTALL_EDITORS="false"
+    INSTALL_NETWORK="false"
     
     [[ "$options" =~ \"1\" ]] && INSTALL_DEV="true"
     [[ "$options" =~ \"2\" ]] && INSTALL_MONITOR="true"
@@ -844,26 +1098,39 @@ advanced_install() {
     [[ "$options" =~ \"4\" ]] && NESTING="true"
     [[ "$options" =~ \"5\" ]] && ONBOOT="1"
     [[ "$options" =~ \"6\" ]] && INSTALL_EDITORS="true"
+    [[ "$options" =~ \"7\" ]] && INSTALL_NETWORK="true"
     
     # Show configuration
+    local gpu_info=$(get_gpu_info_by_index "$GPU_SELECTION")
+    [ "$GPU_SELECTION" = "all" ] && gpu_info="All GPUs ($(get_gpu_count) total)"
+    
     local config="Container Configuration:
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-CTID:      $CTID
-Hostname:  $HOSTNAME
-CPU:       $CORES cores
-Memory:    $MEMORY MB
-Swap:      $SWAP MB
-Disk:      $DISK GB
-Storage:   $STORAGE
-Template:  $(basename "$TEMPLATE")
-Network:   $BRIDGE ($IP)
-CUDA:      $CUDA_VERSION
-Auto-boot: $([ "$ONBOOT" = "1" ] && echo "Yes" || echo "No")
-Nesting:   $([ "$NESTING" = "true" ] && echo "Yes" || echo "No")
-Dev Tools: $([ "$INSTALL_DEV" = "true" ] && echo "Yes" || echo "No")
-Monitors:  $([ "$INSTALL_MONITOR" = "true" ] && echo "Yes" || echo "No")
-Python:    $([ "$INSTALL_PYTHON" = "true" ] && echo "Yes" || echo "No")
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+CTID:       $CTID
+Hostname:   $HOSTNAME
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Resources:
+  CPU:      $CORES cores
+  Memory:   $MEMORY MB
+  Swap:     $SWAP MB
+  Disk:     $DISK GB
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Storage:    $STORAGE
+Template:   $(basename "$TEMPLATE")
+Network:    $BRIDGE ($IP)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+GPU:        $gpu_info
+CUDA:       $CUDA_VERSION
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Features:
+  Auto-boot:  $([ "$ONBOOT" = "1" ] && echo "Yes" || echo "No")
+  Nesting:    $([ "$NESTING" = "true" ] && echo "Yes" || echo "No")
+  Dev Tools:  $([ "$INSTALL_DEV" = "true" ] && echo "Yes" || echo "No")
+  Monitors:   $([ "$INSTALL_MONITOR" = "true" ] && echo "Yes" || echo "No")
+  Python:     $([ "$INSTALL_PYTHON" = "true" ] && echo "Yes" || echo "No")
+  Editors:    $([ "$INSTALL_EDITORS" = "true" ] && echo "Yes" || echo "No")
+  Network:    $([ "$INSTALL_NETWORK" = "true" ] && echo "Yes" || echo "No")
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
     
     if ! confirm_configuration "$config"; then
         msg_warn "Installation cancelled"
@@ -874,41 +1141,58 @@ Python:    $([ "$INSTALL_PYTHON" = "true" ] && echo "Yes" || echo "No")
     create_container "$CTID" "$HOSTNAME" "$CORES" "$MEMORY" "$SWAP" "$DISK" \
         "$TEMPLATE" "$STORAGE" "$BRIDGE" "$IP" "$ONBOOT" "$NESTING"
     
-    configure_gpu_passthrough "$CTID"
+    configure_gpu_passthrough "$CTID" "$GPU_SELECTION"
     start_container "$CTID"
     install_cuda_toolkit "$CTID" "$CUDA_VERSION" "$INSTALL_DEV" "$INSTALL_MONITOR" \
-        "$INSTALL_PYTHON" "$INSTALL_EDITORS"
-    validate_installation "$CTID" "$CUDA_VERSION"
+        "$INSTALL_PYTHON" "$INSTALL_EDITORS" "$INSTALL_NETWORK"
+    validate_installation "$CTID" "$CUDA_VERSION" "$GPU_SELECTION"
     
-    show_completion_summary "$CTID" "$HOSTNAME"
+    show_completion_summary "$CTID" "$HOSTNAME" "$GPU_SELECTION"
 }
 
 show_completion_summary() {
     local ctid=$1
     local hostname=$2
+    local gpu=$3
     
-    whiptail --title "Installation Complete!" \
+    local gpu_desc="GPU $gpu"
+    [ "$gpu" = "all" ] && gpu_desc="All GPUs"
+    
+    whiptail --title "Installation Complete! 🎉" \
         --backtitle "$BACKTITLE" \
-        --msgbox "✓ Container $ctid created successfully!\n\n\
-Hostname: $hostname\n\
-Status: $(pct status "$ctid")\n\n\
-Quick Commands:\n\
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\
+        --msgbox "✓ Container $ctid has been created successfully!\n\n\
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\
+Container Info:\n\
+  CTID:     $ctid\n\
+  Hostname: $hostname\n\
+  Status:   $(pct status "$ctid")\n\
+  GPU:      $gpu_desc\n\
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\
+\n\
+Quick Access Commands:\n\
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\
 Enter container:\n\
-  pct enter $ctid\n\n\
+  pct enter $ctid\n\
+\n\
 Console access:\n\
-  pct console $ctid\n\n\
-Check GPU:\n\
-  pct exec $ctid -- nvidia-smi\n\n\
-Check CUDA:\n\
-  pct exec $ctid -- nvcc --version\n\n\
+  pct console $ctid\n\
+\n\
+Check GPU status:\n\
+  pct exec $ctid -- nvidia-smi\n\
+\n\
+Check CUDA version:\n\
+  pct exec $ctid -- nvcc --version\n\
+\n\
 Container management:\n\
-  pct stop $ctid\n\
-  pct start $ctid\n\
-  pct restart $ctid\n\
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n\
+  pct stop $ctid       # Stop container\n\
+  pct start $ctid      # Start container\n\
+  pct restart $ctid    # Restart container\n\
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\
+\n\
+Enjoy your LXC CUDA container! 🚀\n\
+\n\
 Press OK to exit." \
-        30 $WIDTH
+        32 $WIDTH
 }
 
 #===============================================================================
