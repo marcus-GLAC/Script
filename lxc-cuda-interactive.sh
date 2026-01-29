@@ -17,7 +17,7 @@ var_ram="${var_ram:-16384}"
 var_disk="${var_disk:-50}"
 var_os="${var_os:-debian}"
 var_version="${var_version:-12}"
-var_unprivileged="${var_unprivileged:-0}"
+var_unprivileged="${var_unprivileged:-1}"
 
 # CUDA Configuration
 CUDA_VERSION="${CUDA_VERSION:-12.8}"
